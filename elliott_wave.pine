@@ -1,0 +1,312 @@
+// This Pine Script mirrors the logic of the Python ElliottWaveAnalyzer project.
+// It detects Elliott Wave impulse patterns (1-2-3-4-5) and corrective patterns
+// (A-B-C) using pivot-based zigzag analysis.
+//
+// Source project: https://github.com/rhilmy/elliottwaveanalyzer
+//
+// Wave rules ported from:
+//   models/WaveRules.py  – Impulse, Correction
+//   models/WaveAnalyzer.py – find_impulsive_wave, find_corrective_wave
+//   models/MonoWave.py   – MonoWaveUp / MonoWaveDown
+//   models/functions.py  – hi / lo / next_hi / next_lo (replaced by ta.pivothigh / ta.pivotlow)
+
+//@version=5
+indicator("Elliott Wave Analyzer", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────
+i_pivot_len    = input.int (5,    "Pivot Length",
+     minval=1, maxval=100,
+     tooltip="Bars on each side used to confirm a swing high/low. " +
+             "Larger = fewer but more significant pivots (like higher 'skip' in Python).")
+i_show_impulse = input.bool(true, "Show Impulse Waves (1-2-3-4-5)")
+i_show_corr    = input.bool(true, "Show Corrective Waves (A-B-C)")
+i_show_labels  = input.bool(true, "Show Labels")
+i_line_width   = input.int (2,    "Line Width", minval=1, maxval=5)
+
+// Impulse wave colours
+c_w1 = input.color(color.new(color.lime,       0), "Wave 1", inline="imp")
+c_w2 = input.color(color.new(color.red,        0), "Wave 2", inline="imp")
+c_w3 = input.color(color.new(color.blue,       0), "Wave 3", inline="imp")
+c_w4 = input.color(color.new(color.orange,     0), "Wave 4", inline="imp")
+c_w5 = input.color(color.new(color.purple,     0), "Wave 5", inline="imp")
+
+// Corrective wave colours
+c_wA = input.color(color.new(color.red,        30), "Wave A", inline="corr")
+c_wB = input.color(color.new(color.teal,        0), "Wave B", inline="corr")
+c_wC = input.color(color.new(color.maroon,      0), "Wave C", inline="corr")
+
+// ─────────────────────────────────────────────────────────────
+// ZIGZAG (alternating swing-high / swing-low storage)
+// Mirrors the MonoWaveUp / MonoWaveDown chaining logic.
+// ta.pivothigh / ta.pivotlow replace the Numba hi() / lo()
+// functions from models/functions.py.
+// ─────────────────────────────────────────────────────────────
+var float[] zz_price  = array.new_float()
+var int[]   zz_bar    = array.new_int()
+var bool[]  zz_is_hi  = array.new_bool()   // true = swing high, false = swing low
+
+ph = ta.pivothigh(i_pivot_len, i_pivot_len)
+pl = ta.pivotlow (i_pivot_len, i_pivot_len)
+
+// Push a pivot while maintaining strict high-low alternation.
+// When consecutive pivots have the same direction, keep the more extreme one.
+f_zz_push(float price, int b, bool is_high) =>
+    sz = array.size(zz_price)
+    if sz == 0
+        array.push(zz_price,  price)
+        array.push(zz_bar,    b)
+        array.push(zz_is_hi,  is_high)
+    else
+        bool  prev_hi    = array.last(zz_is_hi)
+        float prev_price = array.last(zz_price)
+        if is_high == prev_hi
+            // Same direction – replace only if more extreme value
+            if (is_high and price > prev_price) or (not is_high and price < prev_price)
+                array.set(zz_price, sz - 1, price)
+                array.set(zz_bar,   sz - 1, b)
+        else
+            // Different direction – append new pivot
+            array.push(zz_price,  price)
+            array.push(zz_bar,    b)
+            array.push(zz_is_hi,  is_high)
+
+if not na(ph)
+    f_zz_push(ph, bar_index - i_pivot_len, true)
+if not na(pl)
+    f_zz_push(pl, bar_index - i_pivot_len, false)
+
+// Limit buffer to the 60 most recent pivots
+while array.size(zz_price) > 60
+    array.shift(zz_price)
+    array.shift(zz_bar)
+    array.shift(zz_is_hi)
+
+// ─────────────────────────────────────────────────────────────
+// WAVE RULE CHECKERS
+// Directly ported from models/WaveRules.py – class Impulse and
+// class Correction (set_conditions methods).
+// ─────────────────────────────────────────────────────────────
+
+// ── Bullish Impulse ── (p0 low → p1 high → p2 low → p3 high → p4 low → p5 high)
+// Mirrors WaveRules.Impulse for an upward 5-wave move.
+f_check_impulse_bull(float p0, float p1, float p2, float p3, float p4, float p5) =>
+    float w1 = p1 - p0   // Wave 1 length
+    float w2 = p1 - p2   // Wave 2 length
+    float w3 = p3 - p2   // Wave 3 length
+    float w4 = p3 - p4   // Wave 4 length
+    float w5 = p5 - p4   // Wave 5 length
+
+    bool ok = true
+    // w2_1 : End of Wave2 must be above Start of Wave1
+    ok := ok and p2 > p0
+    // w2_2 : Wave2 >= 20% of Wave1
+    ok := ok and w2 >= 0.2 * w1
+    // w3_1 : Wave3 must NOT be the shortest wave
+    ok := ok and not (w3 < w5 and w3 < w1)
+    // w3_2 : Wave3 high must exceed Wave1 high
+    ok := ok and p3 > p1
+    // w3_3 : Wave3 >= 1/3 of Wave1
+    ok := ok and w3 >= w1 / 3.0
+    // w3_4 : Wave3 length > Wave2 length
+    ok := ok and w3 > w2
+    // w4_1 : Wave4 low must stay above Wave1 high
+    ok := ok and p4 > p1
+    // w4_2 : Wave4 > 1/3 of Wave2
+    ok := ok and w4 > w2 / 3.0
+    // w5_1 : Wave5 high must exceed Wave3 high
+    ok := ok and p5 > p3
+    // w5_2 : Wave5 < 2× Wave1
+    ok := ok and w5 < 2.0 * w1
+    ok
+
+// ── Bearish Impulse ── (p0 high → p1 low → p2 high → p3 low → p4 high → p5 low)
+// Mirror of the bullish case for downward markets.
+f_check_impulse_bear(float p0, float p1, float p2, float p3, float p4, float p5) =>
+    float w1 = p0 - p1
+    float w2 = p2 - p1
+    float w3 = p2 - p3
+    float w4 = p4 - p3
+    float w5 = p4 - p5
+
+    bool ok = true
+    ok := ok and p2 < p0
+    ok := ok and w2 >= 0.2 * w1
+    ok := ok and not (w3 < w5 and w3 < w1)
+    ok := ok and p3 < p1
+    ok := ok and w3 >= w1 / 3.0
+    ok := ok and w3 > w2
+    ok := ok and p4 < p1
+    ok := ok and w4 > w2 / 3.0
+    ok := ok and p5 < p3
+    ok := ok and w5 < 2.0 * w1
+    ok
+
+// ── Bearish Correction (ABC) ── follows a bullish impulse
+// pA=high (Wave5 end), pB=low (WaveA end), pC=high (WaveB end), pD=low (WaveC end)
+// Mirrors WaveRules.Correction.set_conditions()
+f_check_corr_bear(float pA, float pB, float pC, float pD) =>
+    float wA = pA - pB
+    float wB = pC - pB
+    float wC = pC - pD
+
+    bool ok = true
+    // w2_1 : WaveB high does not exceed WaveA start (Wave5 top)
+    ok := ok and pA > pC
+    // w2_2 : WaveC end goes below WaveA end (WaveB low)
+    ok := ok and pD < pB
+    // w2_3 : WaveB length < WaveA length
+    ok := ok and wA > wB
+    // w2_5 : WaveC > 60% of WaveA
+    ok := ok and wC > 0.60  * wA
+    // w2_6 : WaveC < 261% of WaveA
+    ok := ok and wC < 2.61  * wA
+    // w2_7 : WaveB < 61.8% of WaveA
+    ok := ok and wB < 0.618 * wA
+    // w3_2 : WaveB > 35% of WaveA
+    ok := ok and wB > 0.35  * wA
+    ok
+
+// ── Bullish Correction (ABC) ── follows a bearish impulse
+// pA=low (Wave5 end), pB=high (WaveA end), pC=low (WaveB end), pD=high (WaveC end)
+f_check_corr_bull(float pA, float pB, float pC, float pD) =>
+    float wA = pB - pA
+    float wB = pB - pC
+    float wC = pD - pC
+
+    bool ok = true
+    ok := ok and pA < pC
+    ok := ok and pD > pB
+    ok := ok and wA > wB
+    ok := ok and wC > 0.60  * wA
+    ok := ok and wC < 2.61  * wA
+    ok := ok and wB < 0.618 * wA
+    ok := ok and wB > 0.35  * wA
+    ok
+
+// ─────────────────────────────────────────────────────────────
+// DRAWING UTILITIES
+// ─────────────────────────────────────────────────────────────
+var line[]  g_lines  = array.new_line()
+var label[] g_labels = array.new_label()
+
+f_clear() =>
+    for ln in g_lines
+        line.delete(ln)
+    array.clear(g_lines)
+    for lb in g_labels
+        label.delete(lb)
+    array.clear(g_labels)
+
+f_line(int x1, float y1, int x2, float y2, color c) =>
+    array.push(g_lines, line.new(x1, y1, x2, y2, color=c, width=i_line_width))
+
+f_label(int x, float y, string txt, bool above) =>
+    if i_show_labels
+        lbl_style = above ? label.style_label_down : label.style_label_up
+        array.push(g_labels,
+             label.new(x, y, txt,
+                       style=lbl_style, size=size.small,
+                       color=color.new(color.gray, 60), textcolor=color.white))
+
+// ─────────────────────────────────────────────────────────────
+// MAIN DETECTION  (mirrors WaveAnalyzer.next_cycle)
+//
+// Runs only on the last bar for performance.
+// Scans the zigzag from the most recent pivot backwards,
+// looking for the first valid impulse (+ optional correction).
+// ─────────────────────────────────────────────────────────────
+if barstate.islast
+    f_clear()
+
+    int n = array.size(zz_price)
+    bool found = false
+
+    if n >= 6
+        for si = n - 6 to 0 by -1
+            if found
+                break
+
+            // Read 6 pivots starting at si (needed for impulse)
+            float p0 = array.get(zz_price, si)
+            float p1 = array.get(zz_price, si + 1)
+            float p2 = array.get(zz_price, si + 2)
+            float p3 = array.get(zz_price, si + 3)
+            float p4 = array.get(zz_price, si + 4)
+            float p5 = array.get(zz_price, si + 5)
+            int   b0 = array.get(zz_bar,   si)
+            int   b1 = array.get(zz_bar,   si + 1)
+            int   b2 = array.get(zz_bar,   si + 2)
+            int   b3 = array.get(zz_bar,   si + 3)
+            int   b4 = array.get(zz_bar,   si + 4)
+            int   b5 = array.get(zz_bar,   si + 5)
+            bool  si_is_hi = array.get(zz_is_hi, si)
+
+            // ── Bullish Impulse (starts at swing low) ──────────────
+            if i_show_impulse and not si_is_hi
+                if f_check_impulse_bull(p0, p1, p2, p3, p4, p5)
+                    f_line(b0, p0, b1, p1, c_w1)
+                    f_line(b1, p1, b2, p2, c_w2)
+                    f_line(b2, p2, b3, p3, c_w3)
+                    f_line(b3, p3, b4, p4, c_w4)
+                    f_line(b4, p4, b5, p5, c_w5)
+                    f_label(b0, p0, "0", false)
+                    f_label(b1, p1, "1", true)
+                    f_label(b2, p2, "2", false)
+                    f_label(b3, p3, "3", true)
+                    f_label(b4, p4, "4", false)
+                    f_label(b5, p5, "5", true)
+
+                    // Bearish A-B-C correction after Wave 5
+                    if i_show_corr and si + 8 <= n - 1
+                        float p6 = array.get(zz_price, si + 6)
+                        float p7 = array.get(zz_price, si + 7)
+                        float p8 = array.get(zz_price, si + 8)
+                        int   b6 = array.get(zz_bar,   si + 6)
+                        int   b7 = array.get(zz_bar,   si + 7)
+                        int   b8 = array.get(zz_bar,   si + 8)
+                        // pA = p5 (Wave5 high), pB = p6 (low), pC = p7 (high), pD = p8 (low)
+                        if f_check_corr_bear(p5, p6, p7, p8)
+                            f_line(b5, p5, b6, p6, c_wA)
+                            f_line(b6, p6, b7, p7, c_wB)
+                            f_line(b7, p7, b8, p8, c_wC)
+                            f_label(b6, p6, "A", false)
+                            f_label(b7, p7, "B", true)
+                            f_label(b8, p8, "C", false)
+
+                    found := true
+
+            // ── Bearish Impulse (starts at swing high) ─────────────
+            if i_show_impulse and si_is_hi and not found
+                if f_check_impulse_bear(p0, p1, p2, p3, p4, p5)
+                    f_line(b0, p0, b1, p1, c_w1)
+                    f_line(b1, p1, b2, p2, c_w2)
+                    f_line(b2, p2, b3, p3, c_w3)
+                    f_line(b3, p3, b4, p4, c_w4)
+                    f_line(b4, p4, b5, p5, c_w5)
+                    f_label(b0, p0, "0", true)
+                    f_label(b1, p1, "1", false)
+                    f_label(b2, p2, "2", true)
+                    f_label(b3, p3, "3", false)
+                    f_label(b4, p4, "4", true)
+                    f_label(b5, p5, "5", false)
+
+                    // Bullish A-B-C correction after Wave 5
+                    if i_show_corr and si + 8 <= n - 1
+                        float p6 = array.get(zz_price, si + 6)
+                        float p7 = array.get(zz_price, si + 7)
+                        float p8 = array.get(zz_price, si + 8)
+                        int   b6 = array.get(zz_bar,   si + 6)
+                        int   b7 = array.get(zz_bar,   si + 7)
+                        int   b8 = array.get(zz_bar,   si + 8)
+                        // pA = p5 (Wave5 low), pB = p6 (high), pC = p7 (low), pD = p8 (high)
+                        if f_check_corr_bull(p5, p6, p7, p8)
+                            f_line(b5, p5, b6, p6, c_wA)
+                            f_line(b6, p6, b7, p7, c_wB)
+                            f_line(b7, p7, b8, p8, c_wC)
+                            f_label(b6, p6, "A", true)
+                            f_label(b7, p7, "B", false)
+                            f_label(b8, p8, "C", true)
+
+                    found := true
