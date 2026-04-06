@@ -224,7 +224,10 @@ if barstate.islast
     bool found = false
 
     if n >= 6
-        for si = n - 6 to 0 by -1
+        // Pine Script requires step > 0, so we iterate forward and remap to scan newest-first.
+        // fwd=0 → si=n-6 (newest group), fwd=n-6 → si=0 (oldest group).
+        for fwd = 0 to n - 6
+            int si = (n - 6) - fwd
             if found
                 break
 
